@@ -4,8 +4,4 @@ lief>=0.14.0
 # GUI installer (csp-password-patch.exe)
 customtkinter>=5.2.0
 pyinstaller>=6.0.0
-
-# Legacy auto_password tool (optional)
-pywinauto==0.6.8
-psutil==5.9.5
-Pillow==10.0.0
+Pillow>=10.0.0  # required by customtkinter

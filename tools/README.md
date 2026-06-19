@@ -136,8 +136,8 @@ Build output goes to `tools/output/proxy/` (gitignored).
 ```powershell
 pip install lief
 
-# 1. Build proxy + stage payload
-python tools\build_proxy.py --target SHFolder --source-dir C:\Windows\System32
+# 1. Build proxy + stage payload (--csp-version picks the per-version password)
+python tools\build_proxy.py --target SHFolder --source-dir C:\Windows\System32 --csp-version 4.2.0
 
 # 2. Deploy (elevated — close CSP first)
 powershell -Verb RunAs -ExecutionPolicy Bypass -File tools\deploy_proxy.ps1 -Stem SHFolder
@@ -172,7 +172,7 @@ Deletes the five files above. CSP returns to original (annoying) behavior.
 After editing `frida_deitzmx.js`:
 
 ```powershell
-python tools\build_proxy.py --target SHFolder --source-dir C:\Windows\System32
+python tools\build_proxy.py --target SHFolder --source-dir C:\Windows\System32 --csp-version 4.2.0
 powershell -Verb RunAs -ExecutionPolicy Bypass -File tools\_deploy_hook.ps1
 ```
 
@@ -199,11 +199,3 @@ Check `tools/output/verify_timeline.txt`: success = no
 - **Fallback targets** if `SHFolder` ever conflicts: `msimg32`, `uxtheme`,
   `dwmapi` (all early, non-KnownDLL) — same `build_proxy.py --target …`.
 - **Do not modify `CLIPStudioPaint.exe`** — integrity check will kill it.
-
----
-
-## Legacy external launcher
-
-The older `deitzmx_launcher.py` + `frida.spawn` path still works but requires
-running a separate Python process each launch. The baked-in proxy above replaces
-it for daily use.

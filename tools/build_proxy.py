@@ -31,6 +31,20 @@ HOOK_JS = REPO_ROOT / "tools" / "frida_deitzmx.js"
 OUT_DIR = REPO_ROOT / "tools" / "output" / "proxy"
 INSTALL_DIR = Path(r"C:\Program Files\CELSYS\CLIP STUDIO 1.5\CLIP STUDIO PAINT")
 
+PASSWORD_PLACEHOLDER = "__DEITZMX_PASSWORD__"
+
+# The daily itzmx password phrase differs by word order between CSP builds.
+PASSWORDS: dict[str, str] = {
+    "5.0.0": (
+        "lai2 zi4 bbs.itzmx.com mian3 fei4 fen1 xiang3 fa1 xian4 fan4 mai4 "
+        "tui4 kuan3 ju3 bao4 cha4 ping2 bbs.itzmx.com Always Free"
+    ),
+    "4.2.0": (
+        "lai2 zi4 bbs.itzmx.com mian3 fei4 fen1 xiang3 fa1 xian4 fan4 mai4 "
+        "ju3 bao4 cha4 ping2 tui4 kuan3 bbs.itzmx.com Always Free"
+    ),
+}
+
 _GCC_CANDIDATES = [
     Path(r"C:\ProgramData\mingw64\mingw64\bin\gcc.exe"),
     Path(r"C:\msys64\mingw64\bin\gcc.exe"),
@@ -75,8 +89,13 @@ def write_def(def_path: Path, stem: str, orig_stem: str, exports) -> None:
     def_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def build_hook(out_dir: Path, marker_path: Path | None) -> None:
+def build_hook(out_dir: Path, marker_path: Path | None, password: str) -> None:
     body = HOOK_JS.read_text(encoding="utf-8")
+    if PASSWORD_PLACEHOLDER not in body:
+        raise RuntimeError(
+            f"{HOOK_JS.name} is missing the {PASSWORD_PLACEHOLDER} placeholder"
+        )
+    body = body.replace(PASSWORD_PLACEHOLDER, password)
     if marker_path is not None:
         esc = str(marker_path).replace("\\", "\\\\")
         body = (
@@ -108,7 +127,16 @@ def main() -> None:
                          "Use C:\\Windows\\System32 to shadow a non-KnownDLL system DLL.")
     ap.add_argument("--out-dir", type=Path, default=OUT_DIR)
     ap.add_argument("--marker", type=Path, default=None)
+    ap.add_argument("--csp-version", default="5.0.0",
+                    help="selects the per-version itzmx password baked into the hook")
     args = ap.parse_args()
+
+    password = PASSWORDS.get(args.csp_version)
+    if password is None:
+        raise SystemExit(
+            f"no password configured for CSP version '{args.csp_version}' "
+            f"(known: {', '.join(sorted(PASSWORDS))})"
+        )
 
     stem = args.target
     orig_stem = f"{stem}_orig"
@@ -138,7 +166,8 @@ def main() -> None:
     shutil.copy2(real_dll, args.out_dir / f"{orig_stem}.dll")
     shutil.copy2(GADGET, args.out_dir / "deitzmx.dll")
     build_config(args.out_dir, args.install_dir / "deitzmx_hook.js")
-    build_hook(args.out_dir, args.marker)
+    print(f"Hook password: CSP {args.csp_version}")
+    build_hook(args.out_dir, args.marker, password)
 
     # Verify proxy exports/imports
     b = lief.parse(str(proxy_out))

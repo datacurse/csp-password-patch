@@ -15,19 +15,22 @@ BUILD_PROXY = REPO / "tools" / "build_proxy.py"
 
 def stage(version: str, rebuild: bool) -> Path:
     dest = REPO / "versions" / version / "proxy"
-    if rebuild or not (PROXY_OUT / "deitzmx_hook.js").is_file():
-        subprocess.run(
-            [
-                sys.executable,
-                str(BUILD_PROXY),
-                "--target",
-                "SHFolder",
-                "--source-dir",
-                r"C:\Windows\System32",
-            ],
-            check=True,
-            cwd=str(REPO),
-        )
+    # Always rebuild: the hook's password is per-version, so each version must
+    # regenerate deitzmx_hook.js with --csp-version. (`rebuild` kept for compat.)
+    subprocess.run(
+        [
+            sys.executable,
+            str(BUILD_PROXY),
+            "--target",
+            "SHFolder",
+            "--source-dir",
+            r"C:\Windows\System32",
+            "--csp-version",
+            version,
+        ],
+        check=True,
+        cwd=str(REPO),
+    )
 
     if dest.exists():
         shutil.rmtree(dest)

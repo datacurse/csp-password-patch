@@ -44,8 +44,9 @@ function shouldBypass(text) {
   return false;
 }
 
-const PASSWORD =
-  'lai2 zi4 bbs.itzmx.com mian3 fei4 fen1 xiang3 fa1 xian4 fan4 mai4 tui4 kuan3 ju3 bao4 cha4 ping2 bbs.itzmx.com Always Free';
+// Build-time placeholder. tools/build_proxy.py substitutes the per-version itzmx
+// password (the daily phrase differs by word order between CSP builds).
+const PASSWORD = '__DEITZMX_PASSWORD__';
 
 const SW_HIDE = 0;
 const SWP_SHOWWINDOW = 0x0040;
@@ -54,6 +55,15 @@ const CF_UNICODETEXT = 13;
 const GMEM_MOVEABLE = 0x0002;
 const WM_PASTE = 0x0302;
 const BM_CLICK = 0x00f5;
+const WM_GETTEXT = 0x000d;
+const SMTO_ABORTIFHUNG = 0x0002;
+const GETTEXT_TIMEOUT_MS = 200;
+// GUITHREADINFO.flags bits that mean "a menu is currently being tracked".
+const GUI_INMENUMODE = 0x00000004;
+const GUI_POPUPMENUMODE = 0x00000010;
+const GUI_SYSTEMMENUMODE = 0x00000020;
+// sizeof(GUITHREADINFO) on x64: cbSize(4)+flags(4)+6*HWND(48)+RECT(16).
+const GUITHREADINFO_SIZE = 72;
 
 const FindWindowW = new NativeFunction(getExport('user32.dll', 'FindWindowW'), 'pointer', [
   'pointer',
@@ -86,6 +96,30 @@ const PostMessageW = new NativeFunction(getExport('user32.dll', 'PostMessageW'),
   'pointer',
   'pointer',
 ]);
+// Timeout-bounded variant so reading a window's text can never block the
+// Frida thread on a busy/hung CSP UI thread (the cause of the menu/freeze hang).
+const SendMessageTimeoutW = new NativeFunction(
+  getExport('user32.dll', 'SendMessageTimeoutW'),
+  'long',
+  ['pointer', 'uint', 'pointer', 'pointer', 'uint', 'uint', 'pointer']
+);
+const GetGUIThreadInfo = new NativeFunction(
+  getExport('user32.dll', 'GetGUIThreadInfo'),
+  'int',
+  ['uint', 'pointer']
+);
+
+// True while the user has a menu open. Polling/cross-thread messaging during a
+// menu's modal tracking loop dismisses the dropdown, so we stand down that tick.
+function menuIsOpen() {
+  const info = Memory.alloc(80);
+  info.writeU32(GUITHREADINFO_SIZE);
+  if (GetGUIThreadInfo(0, info) === 0) {
+    return false;
+  }
+  const flags = info.add(4).readU32();
+  return (flags & (GUI_INMENUMODE | GUI_POPUPMENUMODE | GUI_SYSTEMMENUMODE)) !== 0;
+}
 const ShowWindow = new NativeFunction(getExport('user32.dll', 'ShowWindow'), 'int', [
   'pointer',
   'int',
@@ -140,7 +174,10 @@ function getClass(hwnd) {
 
 function getText(hwnd) {
   const buf = Memory.alloc(512 * 2);
-  GetWindowTextW(hwnd, buf, 512);
+  // WM_GETTEXT (wParam = buffer chars, lParam = buffer). ABORTIFHUNG + short
+  // timeout means a stalled UI thread returns immediately instead of pinning us.
+  const result = Memory.alloc(Process.pointerSize);
+  SendMessageTimeoutW(hwnd, WM_GETTEXT, ptr(512), buf, SMTO_ABORTIFHUNG, GETTEXT_TIMEOUT_MS, result);
   return buf.readUtf16String();
 }
 
@@ -269,7 +306,9 @@ function hookMessageBox(name, wide) {
 hookMessageBox('MessageBoxW', true);
 hookMessageBox('MessageBoxA', false);
 
-Interceptor.attach(getExport('kernel32.dll', 'Sleep'), {
+// Kept as a named listener so it can be removed the instant the splash phase
+// ends — a lingering global Sleep() override is what risks freezing the live app.
+const sleepHook = Interceptor.attach(getExport('kernel32.dll', 'Sleep'), {
   onEnter(args) {
     const ms = args[0].toInt32();
     if (ms >= 1000 && ms <= 6000) {
@@ -443,24 +482,165 @@ function autoSubmitPassword() {
   return true;
 }
 
+// --- Lifecycle ------------------------------------------------------------
+// These hooks + polling are STARTUP-ONLY: they exist to skip the splash and
+// auto-fill the password. Leaving them running for the whole session is what
+// made the menu bar unclickable and caused random freezes (perpetual EnumWindows
+// + cross-thread messages, plus a permanent Sleep() override).
+//
+// Fastest safe handoff to the live app:
+//   1. The moment CSP's main window is visible (canvas up) we STOP POLLING and
+//      drop the Sleep override — that's the part that fights the menu bar.
+//   2. The cheap event-driven window hooks linger a few more seconds to swallow
+//      any late itzmx popup, then fully detach. They don't poll, so they don't
+//      touch the menus.
+// Don't honor the main-window signal before this — guards against a transient
+// big window appearing before the password gate is handled. The splash sleep is
+// zeroed and the password shows within ~1s, so this stays safely small.
+const MAIN_READY_MIN_MS = 900;
+const POST_SUBMIT_GRACE_MS = 1000; // fallback: stop this long after a submit
+const NO_DIALOG_TEARDOWN_MS = 5000; // fallback: no password dialog ever appeared
+const HARD_CAP_MS = 90000; // absolute upper bound — never hook a live session
+const EVENT_HOOK_LINGER_MS = 750; // keep event hooks briefly after polling stops
+const PW_TITLE = 'Application requires password to start';
+const MAIN_WIN_MIN_W = 700;
+const MAIN_WIN_MIN_H = 400;
+
+const startedAt = Date.now();
+let submittedAt = 0;
+let pollingStopped = false;
+let tornDown = false;
+
+function passwordWindowPresent() {
+  const titleBuf = Memory.allocUtf16String(PW_TITLE);
+  return !FindWindowW(ptr(0), titleBuf).isNull();
+}
+
+// Reused across ticks to avoid reallocating the callback every 100ms.
+const mainWinState = { pid: Process.id, pidBuf: Memory.alloc(4), found: false };
+const mainWinCb = new NativeCallback(
+  function (hwnd, lparam) {
+    GetWindowThreadProcessId(hwnd, mainWinState.pidBuf);
+    if (mainWinState.pidBuf.readU32() !== mainWinState.pid || IsWindowVisible(hwnd) === 0) {
+      return 1;
+    }
+    // Class + rect are read locally and never block on the (busy) UI thread,
+    // unlike WM_GETTEXT — so this fires the moment the canvas is on screen.
+    const cls = (getClass(hwnd) || '').toLowerCase();
+    if (
+      cls === 'internet explorer_server' ||
+      cls.indexOf('shell embedding') !== -1 ||
+      cls.indexOf(ITZMX_POPUP_SUFFIX) !== -1
+    ) {
+      return 1;
+    }
+    const r = getRect(hwnd);
+    if (r.w >= MAIN_WIN_MIN_W && r.h >= MAIN_WIN_MIN_H) {
+      mainWinState.found = true;
+      return 0;
+    }
+    return 1;
+  },
+  'int',
+  ['pointer', 'pointer']
+);
+
+// A large, visible, non-itzmx top-level window in our process = the canvas. The
+// fullscreen splash is the same size class, but it has no title so the sweep
+// (which runs earlier in the same tick) hides it first; the real canvas window
+// carries a title, so it survives and is the only large visible window left.
+function mainWindowReady() {
+  mainWinState.found = false;
+  EnumWindows(mainWinCb, ptr(0));
+  return mainWinState.found;
+}
+
+function fullTeardown(reason) {
+  if (tornDown) {
+    return;
+  }
+  tornDown = true;
+  try {
+    Interceptor.detachAll();
+  } catch (_) {}
+  send({ type: 'teardown', reason: reason });
+}
+
+function stopPolling(reason) {
+  if (pollingStopped) {
+    return;
+  }
+  pollingStopped = true;
+  try {
+    clearInterval(submitTimer);
+  } catch (_) {}
+  try {
+    clearInterval(sweepTimer);
+  } catch (_) {}
+  // Remove the global Sleep override right away (freeze risk); the event-driven
+  // window hooks are cheap and menu-safe, so let them linger a moment longer.
+  try {
+    sleepHook.detach();
+  } catch (_) {}
+  send({ type: 'stop_polling', reason: reason });
+  setTimeout(function () {
+    fullTeardown('linger_done');
+  }, EVENT_HOOK_LINGER_MS);
+}
+
 const submitTimer = setInterval(function () {
+  if (pollingStopped) {
+    return;
+  }
+  // Never poke the UI thread while a menu is being tracked — it would cancel it.
+  if (menuIsOpen()) {
+    return;
+  }
+  const now = Date.now();
   try {
     sweepHiddenWindows();
-    if (submitted) {
-      const titleBuf = Memory.allocUtf16String('Application requires password to start');
-      if (FindWindowW(ptr(0), titleBuf).isNull()) {
-        return;
-      }
+
+    if (passwordWindowPresent()) {
       submitted = false;
+      autoSubmitPassword();
+      if (submitted) {
+        submittedAt = Date.now();
+      }
+      return;
     }
-    autoSubmitPassword();
+
+    // Password is gone (handled, or bypassed at the dialog-API level). The main
+    // window being visible is the definitive "we're done" signal.
+    if (now - startedAt >= MAIN_READY_MIN_MS && mainWindowReady()) {
+      stopPolling('main_window_ready');
+      return;
+    }
+
+    if (submittedAt !== 0 && now - submittedAt > POST_SUBMIT_GRACE_MS) {
+      stopPolling('password_handled');
+      return;
+    }
+    if (submittedAt === 0 && now - startedAt > NO_DIALOG_TEARDOWN_MS) {
+      stopPolling('no_dialog');
+      return;
+    }
+    if (now - startedAt > HARD_CAP_MS) {
+      stopPolling('hard_cap');
+    }
   } catch (e) {
     send({ type: 'auto_submit_error', error: String(e) });
   }
 }, 100);
 
+// Faster early sweep to catch the splash; self-limits after ~12s.
 let sweepTicks = 0;
 const sweepTimer = setInterval(function () {
+  if (pollingStopped) {
+    return;
+  }
+  if (menuIsOpen()) {
+    return;
+  }
   sweepTicks += 1;
   try {
     sweepHiddenWindows();
@@ -468,7 +648,9 @@ const sweepTimer = setInterval(function () {
     send({ type: 'sweep_error', error: String(e) });
   }
   if (sweepTicks >= 120) {
-    clearInterval(sweepTimer);
+    try {
+      clearInterval(sweepTimer);
+    } catch (_) {}
   }
 }, 100);
 
