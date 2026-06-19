@@ -1,0 +1,25 @@
+{
+    "version": "v4.2.0 Patch1",
+    "exe_sha256": "868BBC5637563E68BD98220AD1D4EE3A5B7FDEADDCED1C368E7141014C3653CB",
+    "decrypted_sha256": "BB67443F30B5CDFDA97EA66CF84056D4DFB7009566B6835EAD31ABF69A7E0451",
+    "description": "De-itzmx patches for CLIPStudioPaint.exe v4.2.0 Patch1 (apply to decrypted candidate via build_deitzmx_exe.py)",
+    "notes": "Patches target decrypted sec8 validation gates traced via Frida CreateFileW backtrace. Requires decrypted sec8/sec9 dump first.",
+    "patches": [
+        {
+            "feature": "startup_gate_nop_je",
+            "rva": "0x5c2d863",
+            "offset": "0x1de9463",
+            "original": "7433",
+            "patched": "9090",
+            "comment": "NOP je after test al,al at startup gate (RVA 0x5c2d861)"
+        },
+        {
+            "feature": "key_validate_branch_nop_jne",
+            "rva": "0x5c2dd62",
+            "offset": "0x1de9962",
+            "original": "7505",
+            "patched": "9090",
+            "comment": "NOP jne after key validation test al,al"
+        }
+    ]
+}
